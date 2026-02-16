@@ -1,0 +1,25 @@
+# Conda environment for D-Intervention
+# Create: conda env create -f environment.yml
+# Activate: conda activate d-intervention
+
+name: bo_intervention
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.11,<3.12
+  - pytorch
+  - numpy
+  - pip
+  - pip:
+    - pyvene
+    - pyreft
+    - transformers>=4.36.0
+    - datasets
+    - evaluate
+    - accelerate
+    - peft
+    - wandb
+    - tqdm
+    - safetensors
