@@ -200,3 +200,95 @@ class LoReftSupervisedDataset(ReftDataset):
         last_position = base_prompt_length
 
         return result, last_position
+
+class LoReftSemantleDataset(ReftDataset):
+    """
+    Semantle word-guessing for LoReFT: fixed prompt + one word per example.
+    data_item must have "word" and optionally "subspaces".
+
+    "subspaces" can be:
+      - a float list of length low_rank_dim  -> LoreftWordIntervention (point b)
+      - int or [int]                         -> DistributionalWordIntervention (word ID)
+    """
+    def preprocess(self, kwargs):
+        self.raw_dataset = None
+        self.trigger_tokens = task_config["semantle"]["fixed_prompt"].split(".")[-1].strip() or " "
+        self.num_labels = None
+        self.task_prompt_template = task_config["semantle"]["fixed_prompt"]
+        self.low_rank_dimension = kwargs.get("low_rank_dimension", 8)
+
+    def tokenize(self, data_item):
+        result = {}
+        base_prompt = self.task_prompt_template
+        word = data_item["word"] if isinstance(data_item, dict) else data_item
+        if isinstance(word, dict):
+            word = word.get("word", list(word.values())[0])
+        base_input = base_prompt + " " + str(word).strip() + self.tokenizer.eos_token
+        base_prompt_ids = self.tokenizer(
+            base_prompt, max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt"
+        )["input_ids"][0]
+        base_prompt_length = len(base_prompt_ids)
+        if self.data_split == "train":
+            base_input_ids = self.tokenizer(
+                base_input, max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt"
+            )["input_ids"][0]
+            output_ids = deepcopy(base_input_ids)
+            output_ids[:base_prompt_length] = -100
+            result["input_ids"] = base_input_ids
+            result["labels"] = output_ids
+        else:
+            result["input_ids"] = base_prompt_ids
+        last_position = base_prompt_length
+        return result, last_position
+
+    def compute_intervention_and_subspaces(self, id, data_item, result, last_position, **kwargs):
+        intervention_locations = self.get_intervention_locations(
+            last_position=last_position, first_n=self.first_n, last_n=self.last_n,
+            pad_mode=self.pad_mode, **kwargs
+        )
+        result["intervention_locations"] = intervention_locations
+        result["id"] = id
+        if self.pad_mode == "first":
+            for field in self.fields_to_pad:
+                if field not in result:
+                    continue
+                if field == "labels":
+                    result[field] = torch.cat((torch.tensor([-100]), result[field]))
+                else:
+                    result[field] = torch.cat((torch.tensor([self.tokenizer.pad_token_id]), result[field]))
+            result["intervention_locations"] = (torch.IntTensor(result["intervention_locations"]) + 1).tolist()
+        elif self.pad_mode == "last":
+            for field in self.fields_to_pad:
+                if field not in result:
+                    continue
+                if field == "labels":
+                    result[field] = torch.cat((result[field], torch.tensor([-100])))
+                else:
+                    result[field] = torch.cat((result[field], torch.tensor([self.tokenizer.pad_token_id])))
+        result["attention_mask"] = (result["input_ids"] != self.tokenizer.pad_token_id).int()
+        num_interventions = kwargs.get("num_interventions", 1)
+        share_weights = kwargs.get("share_weights", False)
+        if share_weights:
+            num_interventions = num_interventions // 2
+        raw_sub = data_item.get("subspaces") if isinstance(data_item, dict) else None
+
+        # Integer word-ID subspaces for DistributionalWordIntervention
+        is_word_id = isinstance(raw_sub, int) or (
+            isinstance(raw_sub, (list, tuple))
+            and len(raw_sub) == 1
+            and isinstance(raw_sub[0], int)
+        )
+        if is_word_id:
+            word_id = raw_sub if isinstance(raw_sub, int) else raw_sub[0]
+            result["subspaces"] = torch.tensor(
+                [[word_id]] * num_interventions, dtype=torch.long
+            )
+        else:
+            b = raw_sub
+            if b is None:
+                b = torch.zeros(self.low_rank_dimension)
+            if isinstance(b, (list, tuple)):
+                b = torch.tensor(b, dtype=torch.float32)
+            # (num_interventions, low_rank_dim) -> stacks to (batch, num_int, low_rank_dim)
+            result["subspaces"] = b.unsqueeze(0).expand(num_interventions, -1).contiguous()
+        return result

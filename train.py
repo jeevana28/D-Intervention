@@ -36,15 +36,15 @@ from pyreft import (
     ReftConfig,
     ReftTrainerForCausalLM, 
     ReftTrainerForSequenceClassification,
-    NoreftIntervention,   # remove ortho.
+    NoreftIntervention,
     LoreftIntervention,
-    ConsreftIntervention, # constant bias only
-    LobireftIntervention, # low-rank bitfit reft
-    DireftIntervention,   # direct edit reft
-    NodireftIntervention, # remove ortho + direct edit reft <- this is like LoRA on time-step
+    LoreftWordIntervention,
+    DistributionalWordIntervention,
+    ConsreftIntervention,
+    LobireftIntervention,
+    DireftIntervention,
+    NodireftIntervention,
     ReftDataCollator,
-    # Below are the D-interventions from the Representation-Editing repo
-    DistributionalreftIntervention,
     VIBRawreftIntervention,
     VIBAffinereftIntervention,
     RedIntervention,
@@ -77,11 +77,12 @@ dtype_mapping = {
 intervention_mapping = {
     "NoreftIntervention": NoreftIntervention,
     "LoreftIntervention": LoreftIntervention,
+    "LoreftWordIntervention": LoreftWordIntervention,
+    "DistributionalWordIntervention": DistributionalWordIntervention,
     "ConsreftIntervention": ConsreftIntervention,
     "LobireftIntervention": LobireftIntervention,
     "DireftIntervention": DireftIntervention,
     "NodireftIntervention": NodireftIntervention,
-    "DistributionalreftIntervention": DistributionalreftIntervention,
     "VIBRawreftIntervention": VIBRawreftIntervention,
     "VIBAffinereftIntervention": VIBAffinereftIntervention,
     "MiniTransformerIntervention": MiniTransformerIntervention,

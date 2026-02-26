@@ -155,4 +155,16 @@ task_config = {
             }
         }
     },
+    # Semantle: fixed prompt for word guessing; LoReFT b per word; BO over b for discovery
+    "semantle": {
+        "train_datasets": None,
+        "eval_datasets": None,
+        "task_prompt_template": None,
+        "trigger_tokens": None,
+        "fixed_prompt": "Your task is to guess a hidden word from the English dictionary. Guess exactly one new word that could be the hidden word. (Note: give only a word JSON format, e.g. {\"response\": [\"word\"]})",
+        "generation_args": {
+            True: {"max_new_tokens": 32, "do_sample": False},
+            False: {"max_new_tokens": 32, "temperature": 0.6, "top_p": 0.9, "do_sample": True}
+        }
+    },
 }
