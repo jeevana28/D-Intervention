@@ -1,5 +1,6 @@
 import pyvene as pv
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import (
     Trainer,
@@ -25,7 +26,7 @@ import evaluate
 import numpy as np
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.utils import logging
-from .interventions import VIBreftIntervention, VIBRawreftIntervention
+from .interventions import VIBreftIntervention, VIBRawreftIntervention, DistributionalWordIntervention
 
 logger = logging.get_logger(__name__)
 
@@ -58,6 +59,19 @@ def make_dataloader(dataset: Dataset, batch_size: int, collate_fn: DataCollatorF
 
 
 class ReftTrainer(Trainer):
+    def __init__(self, *args, word_sim_matrix=None, lambda_sem: float = 0.0, **kwargs):
+        # transformers ≥4.47 renamed `tokenizer` → `processing_class`
+        if "tokenizer" in kwargs:
+            import transformers as _tv
+            _major, _minor = (int(x) for x in _tv.__version__.split(".")[:2])
+            if (_major, _minor) >= (4, 47):
+                kwargs["processing_class"] = kwargs.pop("tokenizer")
+        super().__init__(*args, **kwargs)
+        # Optional (N, N) float32 tensor of pairwise semantic similarities.
+        # Enables the semantic structure loss: similar words → nearby mu vectors.
+        self.word_sim_matrix = word_sim_matrix
+        self.lambda_sem = lambda_sem
+
     def save_model(self, output_dir, _internal_call=False):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -100,35 +114,67 @@ class ReftTrainer(Trainer):
             subspaces=inputs["subspaces"].permute(1, 0, 2).tolist() if "subspaces" in inputs else None
         )
         
-        if (isinstance(list(intervenable.interventions.values())[0][0], VIBreftIntervention) or isinstance(list(intervenable.interventions.values())[0][0], VIBRawreftIntervention)) and list(intervenable.interventions.values())[0][0].use_compression == True:
-            use_compression = list(intervenable.interventions.values())[0][0].use_compression 
-            if use_compression == True:# Add KL divergence loss for VIB interventions
-                kl_loss = 0.0
-                beta = list(intervenable.interventions.values())[0][0].beta  # Hyperparameter to control KL term importance
-                
-                for intervention in intervenable.interventions.values():
-                    
-                    kl_loss += intervention[0].compute_kl_divergence(
-                        intervention[0].last_mu,
-                        intervention[0].last_logvar
-                    )
-                
-                output = cf_outputs
-                
-                total_loss = output.loss + beta * kl_loss
-                
-                print(f"KL Loss: {kl_loss}")
-                print(f"Cross Entropy Loss: {output.loss}")
-                print(f"Total Loss: {total_loss}")
-                # return
-                if cf_outputs is None:
-                    output = base_outputs # in case of lora only training
-                return (output, output) if return_outputs else total_loss
-        else:
-            output = cf_outputs
-            if cf_outputs is None:
-                output = base_outputs # in case of lora only training
-            return (output, output) if return_outputs else output.loss
+        # pyvene may store each intervention as a (obj, ...) tuple or as the object itself
+        def _get_intervention(v):
+            return v[0] if isinstance(v, (list, tuple)) else v
+
+        first_intervention = _get_intervention(list(intervenable.interventions.values())[0])
+
+        output = cf_outputs if cf_outputs is not None else base_outputs
+        total_loss = output.loss
+
+        # ── KL divergence loss ───────────────────────────────────────────────
+        # For VIBreftIntervention / VIBRawreftIntervention: opt-in via use_compression=True.
+        # For DistributionalWordIntervention: applied whenever beta > 0 (no flag needed).
+        kl_loss = torch.tensor(0.0, device=total_loss.device)
+        _has_kl = isinstance(first_intervention, (VIBreftIntervention, VIBRawreftIntervention)) and getattr(first_intervention, 'use_compression', False)
+        _has_kl = _has_kl or (
+            isinstance(first_intervention, DistributionalWordIntervention)
+            and getattr(first_intervention, 'beta', 0.0) > 0
+        )
+        if _has_kl:
+            beta = first_intervention.beta
+            for intervention_val in intervenable.interventions.values():
+                iv = _get_intervention(intervention_val)
+                if hasattr(iv, 'last_mu') and hasattr(iv, 'last_logvar'):
+                    kl_loss = kl_loss + iv.compute_kl_divergence(iv.last_mu, iv.last_logvar)
+            total_loss = total_loss + beta * kl_loss
+
+        # ── Semantic structure loss ──────────────────────────────────────────
+        # Encourage mu vectors of semantically similar words to be nearby in
+        # b-space so that interpolating b vectors yields semantically
+        # intermediate words.
+        
+        # Applied whenever lambda_sem > 0 for DistributionalWordIntervention,
+        # regardless of use_compression.  Crucially, the loss is computed over
+        # ALL word pairs (full embedding table), not just the in-batch subset,
+        # so every word's position in b-space is shaped at every gradient step.
+        # sem_loss = torch.tensor(0.0, device=total_loss.device)
+        # if (
+        #     self.word_sim_matrix is not None
+        #     and self.lambda_sem > 0
+        #     and isinstance(first_intervention, DistributionalWordIntervention)
+        #     and hasattr(first_intervention, 'word_mu')
+        # ):
+        #     # Use the full embedding table so all N*(N-1)/2 word-pair
+        #     # constraints are active at every step (not just C(batch,2) pairs).
+        #     all_mu = first_intervention.word_mu.weight.float()   # (N, D)
+        #     mu_norm = F.normalize(all_mu, dim=-1)
+        #     cos_sim_b = torch.mm(mu_norm, mu_norm.T)              # (N, N)
+
+        #     target_sim = self.word_sim_matrix.to(all_mu.device)   # (N, N)
+        #     sem_loss = F.mse_loss(cos_sim_b, target_sim)
+        #     total_loss = total_loss + self.lambda_sem * sem_loss
+
+        _is_distributional_word = isinstance(first_intervention, DistributionalWordIntervention)
+        if _has_kl or (_is_distributional_word and self.lambda_sem > 0):
+            self.log({
+                "ce_loss":    output.loss.item(),
+                "kl_loss":    kl_loss.item(),
+                "total_loss": total_loss.item(),
+            })
+
+        return (output, output) if return_outputs else total_loss
 
 
 class ReftTrainerForCausalLM(ReftTrainer):

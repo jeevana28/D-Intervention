@@ -18,6 +18,8 @@ from .reft_trainer import (
 from .interventions import (
     NoreftIntervention,
     LoreftIntervention,
+    LoreftWordIntervention,
+    DistributionalWordIntervention,
     ConsreftIntervention,
     LobireftIntervention,
     DireftIntervention,

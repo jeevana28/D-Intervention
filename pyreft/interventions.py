@@ -60,6 +60,118 @@ class LoreftIntervention(
         return
 
 
+class LoreftWordIntervention(
+    SourcelessIntervention,
+    TrainableIntervention,
+    DistributedRepresentationIntervention
+):
+    """
+    LoReFT for word discovery: h + R^T(Wh + b_w - Rh).
+    R and W are shared; b_w is a learned embedding (one vector per word).
+    Subspaces should be integer word IDs (same format as DistributionalWordIntervention).
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs, keep_last_dim=True)
+        rotate_layer = LowRankRotateLayer(self.embed_dim, kwargs["low_rank_dimension"])
+        self.rotate_layer = torch.nn.utils.parametrizations.orthogonal(rotate_layer)
+        self.learned_source = torch.nn.Linear(
+            self.embed_dim, kwargs["low_rank_dimension"]).to(
+            kwargs["dtype"] if "dtype" in kwargs else torch.bfloat16)
+        self.dropout = torch.nn.Dropout(kwargs["dropout"] if "dropout" in kwargs else 0.0)
+        self.act_fn = ACT2FN["linear"] if "act_fn" not in kwargs or kwargs["act_fn"] is None else ACT2FN[kwargs["act_fn"]]
+        self.word_b = torch.nn.Embedding(kwargs["num_words"], kwargs["low_rank_dimension"])
+        torch.nn.init.normal_(self.word_b.weight, mean=0.0, std=0.1)
+
+    def forward(self, base, source=None, subspaces=None):
+        rotated_base = self.rotate_layer(base)
+        wh = self.act_fn(self.learned_source(base))
+        word_ids = torch.tensor(
+            [s[0] if isinstance(s, (list, tuple)) else s for s in subspaces],
+            dtype=torch.long, device=base.device,
+        )
+        b = self.word_b(word_ids).to(dtype=wh.dtype).unsqueeze(1)  # (batch, 1, r)
+        wh = wh + b
+        delta = wh - rotated_base
+        output = base + torch.matmul(delta, self.rotate_layer.weight.T)
+        return self.dropout(output.to(base.dtype))
+
+
+class DistributionalWordIntervention(
+    SourcelessIntervention,
+    TrainableIntervention,
+    DistributedRepresentationIntervention
+):
+    """
+    Distributional LoReFT for word discovery: h + R^T(Wh + b - Rh).
+
+    Each word w has a distribution N(mu_w, sigma_w^2) over b instead of a point estimate.
+    W (learned_source) and R (rotate_layer) are shared; per-word mu and logvar are stored
+    in nn.Embedding tables indexed by integer word IDs passed via subspaces.
+    At each forward pass b is sampled via the reparameterization trick;
+    KL(q(b|w) || N(0,I)) is computed by the trainer using last_mu / last_logvar.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs, keep_last_dim=True)
+        rotate_layer = LowRankRotateLayer(self.embed_dim, kwargs["low_rank_dimension"])
+        self.rotate_layer = torch.nn.utils.parametrizations.orthogonal(rotate_layer)
+        self.learned_source = torch.nn.Linear(
+            self.embed_dim, kwargs["low_rank_dimension"]).to(
+            kwargs["dtype"] if "dtype" in kwargs else torch.bfloat16)
+        self.dropout = torch.nn.Dropout(kwargs["dropout"] if "dropout" in kwargs else 0.0)
+        self.act_fn = ACT2FN["linear"] if "act_fn" not in kwargs or kwargs["act_fn"] is None else ACT2FN[kwargs["act_fn"]]
+
+        num_words = kwargs.get("num_words", 1)
+        sigma_init = kwargs.get("sigma_b", 0.1)
+        low_rank_dim = kwargs["low_rank_dimension"]
+
+        self.word_mu = torch.nn.Embedding(num_words, low_rank_dim)
+        torch.nn.init.normal_(self.word_mu.weight, mean=0.0, std=sigma_init)
+
+        # Initialize logvar=0 (variance=1 = prior N(0,I)), so initial KL~0.
+        self.word_logvar = torch.nn.Embedding(num_words, low_rank_dim)
+        torch.nn.init.zeros_(self.word_logvar.weight)
+
+        self.beta = kwargs.get("beta", 0.1)
+        self.use_compression = kwargs.get("use_compression", True)
+
+    def reparameterize(self, mu, logvar):
+        """Sample from N(mu, exp(logvar)) with clamped std for stability."""
+        logvar = torch.clamp(logvar, min=-14.0, max=2.0)
+        std = torch.exp(0.5 * logvar)
+        std = torch.clamp(std, min=1e-4, max=1.0)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def compute_kl_divergence(self, mu, logvar):
+        """KL(N(mu, exp(logvar)) || N(0, I))"""
+        logvar = torch.clamp(logvar, min=-14.0, max=2.0)
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+        return kl.mean()
+
+    def forward(self, base, source=None, subspaces=None):
+        rotated_base = self.rotate_layer(base)
+        wh = self.act_fn(self.learned_source(base))
+
+        # subspaces: [[word_id], [word_id], ...] — one int ID per batch item
+        word_ids = torch.tensor(
+            [s[0] if isinstance(s, (list, tuple)) else s for s in subspaces],
+            dtype=torch.long, device=wh.device,
+        )
+        mu     = self.word_mu(word_ids)       # (batch, r)
+        logvar = self.word_logvar(word_ids)   # (batch, r)
+        if self.training:
+            b = self.reparameterize(mu, logvar).to(dtype=wh.dtype).unsqueeze(1)  # (batch, 1, r)
+        else:
+            b = mu.to(dtype=wh.dtype).unsqueeze(1)  # deterministic mu during eval
+        self.last_mu     = mu
+        self.last_logvar = logvar
+
+        wh = wh + b
+        delta  = wh - rotated_base
+        output = base + torch.matmul(delta, self.rotate_layer.weight.T)
+        return self.dropout(output.to(base.dtype))
+
+
 class NoreftIntervention(
     SourcelessIntervention,
     TrainableIntervention, 

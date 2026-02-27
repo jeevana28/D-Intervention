@@ -33,13 +33,14 @@ class ReftModel(pv.IntervenableModel):
         _linked_key_set = set([])
         trainable_intervention_parameters = 0
         for k, v in self.interventions.items():
-            if isinstance(v[0], pv.TrainableIntervention):
+            intervention_obj = v[0] if isinstance(v, (list, tuple)) else v
+            if isinstance(intervention_obj, pv.TrainableIntervention):
                 if k in self._intervention_reverse_link:
                     if not self._intervention_reverse_link[k] in _linked_key_set:
                         _linked_key_set.add(self._intervention_reverse_link[k])
-                        trainable_intervention_parameters += count_parameters(v[0])
+                        trainable_intervention_parameters += count_parameters(intervention_obj)
                 else:
-                    trainable_intervention_parameters += count_parameters(v[0])
+                    trainable_intervention_parameters += count_parameters(intervention_obj)
 
         trainable_model_parameters = sum(
             p.numel() for p in self.model.parameters() if p.requires_grad)
