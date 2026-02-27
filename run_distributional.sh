@@ -8,4 +8,6 @@ python semantle_reft_bo.py \
   --lambda_sem 0.0 \
   --beta 0.5 \
   --output_dir out_distributional \
-  --cache_dir /datasets/ai/llama3/hub
+  --cache_dir /datasets/ai/llama3/hub \
+  --wandb_project semantle-reft \
+  --wandb_run_name distributional-computer

@@ -66,8 +66,9 @@ class LoreftWordIntervention(
     DistributedRepresentationIntervention
 ):
     """
-    LoReFT for word discovery: h + R^T(Wh + b - Rh).
-    W (learned_source) is shared; b is passed per-token via subspaces (one b per word).
+    LoReFT for word discovery: h + R^T(Wh + b_w - Rh).
+    R and W are shared; b_w is a learned embedding (one vector per word).
+    Subspaces should be integer word IDs (same format as DistributionalWordIntervention).
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs, keep_last_dim=True)
@@ -78,14 +79,18 @@ class LoreftWordIntervention(
             kwargs["dtype"] if "dtype" in kwargs else torch.bfloat16)
         self.dropout = torch.nn.Dropout(kwargs["dropout"] if "dropout" in kwargs else 0.0)
         self.act_fn = ACT2FN["linear"] if "act_fn" not in kwargs or kwargs["act_fn"] is None else ACT2FN[kwargs["act_fn"]]
+        self.word_b = torch.nn.Embedding(kwargs["num_words"], kwargs["low_rank_dimension"])
+        torch.nn.init.normal_(self.word_b.weight, mean=0.0, std=0.1)
 
     def forward(self, base, source=None, subspaces=None):
         rotated_base = self.rotate_layer(base)
         wh = self.act_fn(self.learned_source(base))
-        b = (torch.tensor(subspaces, dtype=wh.dtype, device=wh.device)
-             if isinstance(subspaces, (list, tuple))
-             else subspaces.to(dtype=wh.dtype, device=wh.device))
-        wh = wh + b.unsqueeze(1)   # (batch, 1, r) -> broadcast over seq_len
+        word_ids = torch.tensor(
+            [s[0] if isinstance(s, (list, tuple)) else s for s in subspaces],
+            dtype=torch.long, device=base.device,
+        )
+        b = self.word_b(word_ids).to(dtype=wh.dtype).unsqueeze(1)  # (batch, 1, r)
+        wh = wh + b
         delta = wh - rotated_base
         output = base + torch.matmul(delta, self.rotate_layer.weight.T)
         return self.dropout(output.to(base.dtype))
@@ -154,7 +159,10 @@ class DistributionalWordIntervention(
         )
         mu     = self.word_mu(word_ids)       # (batch, r)
         logvar = self.word_logvar(word_ids)   # (batch, r)
-        b      = self.reparameterize(mu, logvar).to(dtype=wh.dtype).unsqueeze(1)  # (batch, 1, r)
+        if self.training:
+            b = self.reparameterize(mu, logvar).to(dtype=wh.dtype).unsqueeze(1)  # (batch, 1, r)
+        else:
+            b = mu.to(dtype=wh.dtype).unsqueeze(1)  # deterministic mu during eval
         self.last_mu     = mu
         self.last_logvar = logvar
 

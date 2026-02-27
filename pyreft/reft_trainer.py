@@ -60,6 +60,12 @@ def make_dataloader(dataset: Dataset, batch_size: int, collate_fn: DataCollatorF
 
 class ReftTrainer(Trainer):
     def __init__(self, *args, word_sim_matrix=None, lambda_sem: float = 0.0, **kwargs):
+        # transformers ≥4.47 renamed `tokenizer` → `processing_class`
+        if "tokenizer" in kwargs:
+            import transformers as _tv
+            _major, _minor = (int(x) for x in _tv.__version__.split(".")[:2])
+            if (_major, _minor) >= (4, 47):
+                kwargs["processing_class"] = kwargs.pop("tokenizer")
         super().__init__(*args, **kwargs)
         # Optional (N, N) float32 tensor of pairwise semantic similarities.
         # Enables the semantic structure loss: similar words → nearby mu vectors.
@@ -162,9 +168,11 @@ class ReftTrainer(Trainer):
 
         _is_distributional_word = isinstance(first_intervention, DistributionalWordIntervention)
         if _has_kl or (_is_distributional_word and self.lambda_sem > 0):
-            print(f"KL Loss: {kl_loss.item():.4f} | "
-                  f"CE Loss: {output.loss.item():.4f} | "
-                  f"Total: {total_loss.item():.4f}")
+            self.log({
+                "ce_loss":    output.loss.item(),
+                "kl_loss":    kl_loss.item(),
+                "total_loss": total_loss.item(),
+            })
 
         return (output, output) if return_outputs else total_loss
 
